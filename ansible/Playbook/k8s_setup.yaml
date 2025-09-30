@@ -1,0 +1,153 @@
+- name: Kubernetes Cluster - Common Configuration
+  hosts: all # master + worker = hepsi
+  become: true # root yetkisi
+  tasks: # task lar module lerden olusuyor
+
+    - name: Set hostname from private DNS name
+      ansible.builtin.hostname:
+        name: "{{ hostvars[inventory_hostname]['private_dns_name'] }}" # ansible da güzel 1 dynamic kullanim
+
+    - name: Ensure required kernel modules are loaded at boot
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Load overlay module immediately
+      community.general.modprobe:
+        name: overlay
+        state: present
+
+    - name: Load br_netfilter module immediately
+      community.general.modprobe:
+        name: br_netfilter
+        state: present
+    
+    - name: Enable bridged networking and IP forwarding
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/k8s.conf # bu dosya henüpz yok, olusacak
+        content: |              # 1 burda enable anlaminda
+          net.ipv4.ip_forward = 1  # yukardaki, olusacak dosyaya content olarak bunu ekle
+      notify: Reload sysctl     # buraya ne yaziyorsam, asagida headler de bu islem calisiyor, burda system restart oluyor
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install required base packages
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - curl
+          - ca-certificates
+          - gpg
+        state: present # ustteki 4 paket apt modülüyle güncel hali indiriliyor. cünkü makineler ubuntu
+
+    - name: Add Kubernetes GPG key & repository
+      ansible.builtin.shell: |
+        rm /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.33/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg && \
+        echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.33/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install Kubernetes packages
+      ansible.builtin.apt:
+        name:
+          - kubelet # node lari yönettigimiz kübernetes kompenenti
+          - kubeadm # kübernets i yönetiyoruz
+          - kubectl # komut verip cli yi yönettigimiz obje
+          - kubernetes-cni # network arayüz icin kullaniyoruz
+          - docker.io #konteinerd yi kullaniyor docker, docker iinince o da iner. Kübernetes de konteiner üretecek yazilim gerekli. O da konteinerd
+        state: present # bu 5 paketin güncel halini apt modülüyle indiriyoruz, cünkü makineker ubuntu.
+
+    - name: Hold Kubernetes packages
+      ansible.builtin.command: apt-mark hold kubelet kubeadm kubectl # yukardaki paketlerin versionlarini, aralarinda calisirken uyumsuzluk olmasin diye, arasinda sürüm uyumu saglar
+
+    - name: Add ubuntu user to docker group # docker komutlarini ubuntuda sudo'suz kullanabilmek icin, ubuntu user i docker gruba ekliyoruz
+      ansible.builtin.user: # ubuntu user u, docker group a ekler
+        name: ubuntu
+        groups: docker
+        append: true        # ubuntu user i eski gruplarinda tutar
+
+    - name: Enable and restart Docker 
+      ansible.builtin.service: # docker service yi enable et, service modülü ile
+        name: docker
+        state: restarted
+        enabled: true
+
+    - name: Configure containerd cgroup driver #
+      ansible.builtin.shell: |  # performansi muhafaza eder
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+    - name: Enable and restart containerd
+      ansible.builtin.service:
+        name: containerd
+        state: restarted
+        enabled: true
+
+  handlers: # handleri yukarda kullandik, sistem restart oluyor ve degisiklikleri almis oluyor böylece
+    - name: Reload sysctl # yukaridaki notify in degerini giriyoruz
+      ansible.builtin.command: sysctl --system
+
+- name: Kubernetes Cluster - Master Node Configuration
+  hosts: role_master # Burdan itibaren playbook master makine icin gecerli
+  become: true
+  tasks:
+      
+    - name: Pull Kubernetes images
+      ansible.builtin.command: kubeadm config images pull
+
+    - name: Initialize Kubernetes master
+      ansible.builtin.command: kubeadm init --pod-network-cidr=10.244.0.0/16 --ignore-preflight-errors=All
+
+      
+    - name: Configure kubeconfig for ubuntu user
+      ansible.builtin.shell: |
+        mkdir -p /home/ubuntu/.kube
+        cp -i /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+        chown ubuntu:ubuntu /home/ubuntu/.kube/config  # config dosyasinin owner i artik ubuntu, cluster in yetkisi ubuntuda
+
+    - name: Install Flannel CNI # 
+      ansible.builtin.shell: kubectl apply -f https://github.com/coreos/flannel/raw/master/Documentation/kube-flannel.yml # bu komutun düzgün calismasi icin, ubuntu user in girmesi lazim
+      become: false # root ile yapma, owner ubuntu cünkü, root un burda yetkisi yok, aksi halde hata aliriz
+      remote_user: ubuntu
+
+    - name: Generate kubeadm join command # clustera baska makineleri dahil etmek icin- token aliyorum
+      ansible.builtin.command: kubeadm token create --print-join-command
+      register: join_command # register islemin sonucunu bir degiskene atar, degiskenin adi burda join_command
+
+    - name: Show join command
+      ansible.builtin.debug: # debug modülü ile bunu yazdir dedigimizde
+        msg: "{{ join_command.stdout }}" # ciktinin bize lazim olan kismini görmüs olcaz, master makinenin calisan playbookunun ciktisinda görüyoz (token yani), bunu alip worker lara girdirirsem olay bitecek, yani otomatik olarak worker in terminalinde girdirirsem.
+
+    - name: Save join command for worker nodes
+      ansible.builtin.add_host: # ansible a sanki 1 host makine daha ekliyor(kandiriyoruz gb.) ve adini kube_master yapti, abc de diyebilirdi, 
+        name: kube_master # 3 tane yönetilen makine var-2 worker,1 master. Bir de bu var yalanci olarak, oldu 4
+        worker_join: "{{ join_command.stdout }}" # rastgele bir degisken ismi(worker_join) belirleyip, join_command i ona atadim, yani token'i
+
+    - name: Install Helm # uygulamayi deploy ederken helm kullanacagimizdan, helm i master a yükledik.
+      ansible.builtin.shell: |
+        curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+        chmod +x get_helm.sh
+        ./get_helm.sh
+      become: false
+      remote_user: ubuntu
+
+- name: Kubernetes Cluster - Worker Node Configuration # Worker node lara geldim
+  hosts: role_worker
+  become: true
+  tasks:
+
+    - name: Join worker to the cluster # add_host modülüyle bir host ekliyorum, bu host a degisken atayip, hostvars in icine worker_join degiskenini de katmis oluyorum. Dinamik bir sekilde onun degiskenini de sisteme(workerlara) eklemis oluyorum.
+      ansible.builtin.shell: "{{ hostvars['kube_master']['worker_join'] }}" #yukarda ekledigimiz kube_masterin, worker join degiskenini iki tane worker node un terminalinde shell komutu olarak gir. Artik tmm
+      register: join_output
+
+    - name: Show join output
+      ansible.builtin.debug:
+        msg: "{{ join_output.stdout }}"
