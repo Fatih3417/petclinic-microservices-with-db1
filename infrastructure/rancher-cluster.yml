@@ -1,0 +1,25 @@
+nodes:
+  - address: 172.31.68.188               # Change with the Private Ip of rancher server, kendi ip mi al
+    internal_address: 172.31.68.188       # Change with the Private Ip of rancher server, kendi ip mi al
+    user: ubuntu
+    role:
+      - controlplane
+      - etcd
+      - worker
+
+# ignore_docker_version: true
+
+services:
+  etcd:    # kübernetes in database i
+    snapshot: true
+    creation: 6h   # 6 saatte 1 snapshot al
+    retention: 24h  # 24 saat sakla
+
+ssh_key_path: ~/.ssh/petclinic-rancher.pem # jenkins ssh la rancher a baglanip ordan komutlar giriyor, Reibungslos baglanma icin bu konum dogru olmali
+
+# Required for external TLS termination with
+# ingress-nginx v0.22+
+ingress:   # bu kisim olmasa da sknti olmaz sanki
+  provider: nginx
+  options:
+    use-forwarded-headers: "true"  # header lari kullan
