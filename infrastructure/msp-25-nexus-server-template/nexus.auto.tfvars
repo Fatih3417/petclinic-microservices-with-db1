@@ -1,0 +1,6 @@
+mykey = "clarusway"
+ami = "ami-052064a798f08f0d3"
+region = "us-east-1"
+instance_type = "t3a.medium"
+nexus_server_secgr = "petclinic-nexus-server-secgr"
+nexus-server-tag = "Nexus Server of Petclinic"
